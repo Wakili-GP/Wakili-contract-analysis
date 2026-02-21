@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ⚖️ AI Legal Auditor (المستشار القانوني الذكي)
 
 نظام متطور يعتمد على الذكاء الاصطناعي (RAG Architecture) لتدقيق وتحليل العقود القانونية وفقاً للقانون المصري، باستخدام موديلات Llama 3.3 وتقنيات معالجة اللغة الطبيعية.
@@ -19,3 +20,18 @@
 1. قم بتحميل المستودع:
    ```bash
    git clone [https://github.com/Nouraessam123/contract-analyzer-ai.git](https://github.com/Nouraessam123/contract-analyzer-ai.git)
+=======
+---
+title: Contract Analyzer Api
+emoji: 🏢
+colorFrom: yellow
+colorTo: indigo
+sdk: gradio
+sdk_version: 6.6.0
+app_file: app.py
+pinned: false
+license: apache-2.0
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+>>>>>>> b7566f35111310df7e87b724d0eb3a208ccaa45f
