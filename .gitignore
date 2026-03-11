@@ -11,7 +11,7 @@ venv/
 .env/
 .env.local
 .env.*.local
-
+.env
 # VS Code settings (مش لازم تترفع)
 .vscode/
 
