@@ -1,3 +1,4 @@
+import modal
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -11,39 +12,74 @@ import re
 import uuid
 import logging
 from datetime import datetime, timedelta
+from typing import Dict
 from dotenv import load_dotenv
+load_dotenv()  # ده هيحمل الـ .env تلقائيًا
+# LangChain imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from typing import Dict
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# ────────────────────────────────────────────────
+# Modal Configuration
+# ────────────────────────────────────────────────
 
-app = FastAPI(title="Legal AI Auditor API")
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        "fastapi",
+        "uvicorn",
+        "slowapi",
+        "python-dotenv",
+        "python-docx",
+        "python-multipart",
+        "langchain",
+        "langchain-community",
+        "langchain-huggingface",
+        "langchain-groq",
+        "chromadb>=0.4.0,<0.6.0",          # ← هنا الحل: نطاق يتجنب 0.5.4/0.5.5
+        "langchain-chroma>=0.1.2",         # ← أحدث شوية عشان يدعم chromadb الحديث
+        "sentence-transformers",
+        "pypdf",
+    )
+)
+
+app = modal.App("legal-ai-auditor", image=image)
+
+# Volume لتخزين قواعد Chroma بشكل دائم
+chroma_vol = modal.Volume.from_name("chroma-storage", create_if_missing=True)
+
+# الـ FastAPI app الرئيسي
+fastapi_app = FastAPI(title="Legal AI Auditor API")
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+fastapi_app.state.limiter = limiter
+fastapi_app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-app.add_middleware(
+fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Cache: analysis_id → (vectorstore, expiry_time)
+# Cache في الذاكرة (لكل container)
 vectorstore_cache: Dict[str, tuple[Chroma, datetime]] = {}
 
-embeddings = HuggingFaceEmbeddings(model_name="./my_model")
+
+# embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+#embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")  # ← لو حافظتي على local، لازم تحمليه في volume
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 llm = ChatGroq(
     temperature=0,
     api_key=os.getenv("GROQ_API_KEY"),
@@ -60,7 +96,9 @@ async def create_vectorstore(file: UploadFile, collection_name: str) -> Chroma:
     if file_ext not in ["pdf", "docx"]:
         raise HTTPException(400, "برجاء رفع ملف PDF أو DOCX فقط.")
 
-    temp_path = f"temp_{uuid.uuid4()}.{file_ext}"
+    temp_path = f"/tmp/temp_{uuid.uuid4()}.{file_ext}"
+    persist_dir = f"/chroma/{collection_name}"  # داخل الـ volume
+
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -81,8 +119,11 @@ async def create_vectorstore(file: UploadFile, collection_name: str) -> Chroma:
         vectorstore = Chroma.from_documents(
             documents=splits,
             embedding=embeddings,
-            collection_name=collection_name
+            collection_name=collection_name,
+            persist_directory=persist_dir
         )
+
+        chroma_vol.commit()  # حفظ التغييرات
         return vectorstore
 
     finally:
@@ -97,14 +138,17 @@ def cleanup_cache():
             to_delete.append(analysis_id)
             try:
                 vectorstore.delete_collection()
-                logger.info(f"[CLEANUP] Deleted collection for expired analysis_id: {analysis_id}")
+                logger.info(f"[CLEANUP] Deleted collection for {analysis_id}")
             except Exception as e:
-                logger.warning(f"[CLEANUP] Failed to delete collection for {analysis_id}: {str(e)}")
-
+                logger.warning(f"[CLEANUP] Failed: {str(e)}")
     for aid in to_delete:
         del vectorstore_cache[aid]
 
-@app.post("/analyze")
+# ────────────────────────────────────────────────
+# Endpoints
+# ────────────────────────────────────────────────
+
+@fastapi_app.post("/analyze")
 @limiter.limit("10/minute")
 async def analyze_contract(request: Request, file: UploadFile = File(...), history: str = Form("[]")):
     cleanup_cache()
@@ -115,7 +159,7 @@ async def analyze_contract(request: Request, file: UploadFile = File(...), histo
         vectorstore = await create_vectorstore(file, collection_name)
         expiry = datetime.now() + timedelta(hours=1)
         vectorstore_cache[analysis_id] = (vectorstore, expiry)
-        logger.info(f"[ANALYZE] Vectorstore cached for {analysis_id} until {expiry}")
+        logger.info(f"[ANALYZE] Cached → {analysis_id}")
 
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
@@ -131,7 +175,6 @@ async def analyze_contract(request: Request, file: UploadFile = File(...), histo
             context = context[:8000] + "\n[تم تقصير السياق]"
 
         full_prompt = f"""أنت مستشار قانوني مصري خبير. حلل العقد بناءً على السياق المقدم فقط.
-
 قواعد صارمة:
 - لا تستخدم أي معرفة خارج السياق أبدًا.
 - حدد نوع العقد بدقة من العنوان أو المقدمة أو العبارات الصريحة فقط.
@@ -172,15 +215,15 @@ async def analyze_contract(request: Request, file: UploadFile = File(...), histo
         response = llm.invoke(full_prompt)
         content = response.content.strip()
 
-        logger.info(f"[ANALYZE] Raw LLM response:\n{content[:800]}...")
-
         start = content.find('{')
         end = content.rfind('}') + 1
         if start == -1 or end <= start:
-            raise ValueError("لم يتم العثور على { أو } في الرد")
+            raise ValueError("LLM did not return valid JSON")
 
         json_str = content[start:end]
         analysis_dict = json.loads(json_str)
+
+        chroma_vol.commit()  # حفظ إضافي بعد التحليل
 
         return {
             "analysis_id": analysis_id,
@@ -190,10 +233,10 @@ async def analyze_contract(request: Request, file: UploadFile = File(...), histo
         }
 
     except Exception as e:
-        logger.exception(f"[ANALYZE] Error: {str(e)}")
+        logger.exception("[ANALYZE] Error")
         raise HTTPException(500, f"خطأ أثناء التحليل: {str(e)}")
 
-@app.post("/chat")
+@fastapi_app.post("/chat")
 @limiter.limit("20/minute")
 async def chat_with_contract(request: Request, data: Dict = Body(...)):
     cleanup_cache()
@@ -206,15 +249,33 @@ async def chat_with_contract(request: Request, data: Dict = Body(...)):
 
     logger.info(f"[CHAT] طلب جديد → analysis_id: {analysis_id} | السؤال: {query[:100]}")
 
-    if analysis_id not in vectorstore_cache:
-        logger.warning(f"[CHAT] الـ analysis_id مش موجود في الكاش: {analysis_id}")
-        raise HTTPException(404, "الـ analysis_id غير موجود أو انتهت صلاحيته. ارفعي العقد من جديد.")
+    collection_name = f"contract_{analysis_id.replace('-', '_')[:20]}"
+    persist_dir = f"/chroma/{collection_name}"
 
     try:
-        vectorstore, expiry = vectorstore_cache[analysis_id]
-        logger.info(f"[CHAT] تم العثور على vectorstore لـ {analysis_id} (ينتهي في {expiry})")
+        # 1. جرب تحميل من الـ cache أولاً
+        if analysis_id in vectorstore_cache:
+            vectorstore, expiry = vectorstore_cache[analysis_id]
+            logger.info(f"[CHAT] تم العثور على vectorstore في الكاش لـ {analysis_id} (ينتهي في {expiry})")
+        else:
+            # 2. لو مش موجود في الكاش → حمل من الـ volume (الديسك الدائم)
+            logger.info(f"[CHAT] مش موجود في الكاش، جاري تحميل من الـ volume: {collection_name}")
+            vectorstore = Chroma(
+                collection_name=collection_name,
+                embedding_function=embeddings,
+                persist_directory=persist_dir
+            )
+            # أضيفه للكاش عشان المرات الجاية
+            expiry = datetime.now() + timedelta(hours=1)
+            vectorstore_cache[analysis_id] = (vectorstore, expiry)
+            chroma_vol.reload()  # تأكد إن الـ volume محدث
+            logger.info(f"[CHAT] تم تحميل vectorstore بنجاح من الـ volume وإضافته للكاش")
 
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 12})  # زودنا شوية عشان نجيب سياق أكبر
+        # 3. باقي الكود زي ما كان (retriever + context + prompt + response)
+        recent_history = history[-8:] if len(history) >= 8 else history
+        history_text = json.dumps(recent_history, ensure_ascii=False, indent=2)
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
         logger.info("[CHAT] تم إنشاء retriever بنجاح")
 
         context_docs = retriever.invoke(query)
@@ -224,15 +285,13 @@ async def chat_with_contract(request: Request, data: Dict = Body(...)):
         if len(context) > 10000:
             context = context[:10000] + "\n[تم تقصير السياق للحد الأقصى]"
 
-        history_text = json.dumps(history, ensure_ascii=False, indent=2)
-
         full_prompt = f"""أنت مستشار قانوني مصري خبير بالقوانين المصرية.
 
 القواعد الصارمة التي يجب اتباعها بدون استثناء:
 1. ابدأ ردك مباشرة بالـ JSON بدون أي كلمة أو مسافة أو سطر قبل العلامة {{
 2. لا تضع أي نص بعد الـ }} الختامي للـ JSON.
 3. لا تضع تعليقات داخل الـ JSON (مثل // أو /* */).
-4. ضمن أن الـ JSON صالح نحويًا 100%: كل المفاتيح والقيم النصية داخل "" مزدوجة، والقوائم والكائنات صحيحة.
+4. ضمن أن الـ JSON صالح نحويًا 100%.
 
 ترتيب الأولوية في الإجابة:
 - أولاً: ابحث في "السياق المستخرج من العقد" وابحث عن إجابة واضحة أو مباشرة.
@@ -275,7 +334,11 @@ async def chat_with_contract(request: Request, data: Dict = Body(...)):
             if not answer.strip():
                 answer = "لا توجد معلومات كافية في العقد"
             logger.info("[CHAT] تم استخراج الإجابة بنجاح")
-            return {"answer": answer, "status": "success"}
+            return {
+            "answer": answer,
+            "status": "success",
+            "history": recent_history + [{"role": "assistant", "content": answer}]  # أضيفي الرد للـ history
+            }
         except json.JSONDecodeError as e:
             logger.error(f"[CHAT] خطأ في تحليل JSON: {str(e)}\nالنص المستخرج: {json_str[:300]}...")
             return {"status": "error", "message": f"خطأ في تحليل رد النموذج: {str(e)}"}
@@ -283,6 +346,22 @@ async def chat_with_contract(request: Request, data: Dict = Body(...)):
     except Exception as e:
         logger.exception(f"[CHAT] خطأ غير متوقع لـ analysis_id {analysis_id}")
         raise HTTPException(500, f"خطأ داخلي في الدردشة: {str(e)}. شوفي logs السيرفر.")
-@app.get("/")
+@fastapi_app.get("/")
 async def root():
-    return {"status": "online"}
+    return {"status": "online", "active_sessions": len(vectorstore_cache)}
+
+# ────────────────────────────────────────────────
+# Modal ASGI entrypoint
+# ────────────────────────────────────────────────
+
+@app.function(
+    image=image,
+    volumes={"/chroma": chroma_vol},
+    timeout=600,
+    secrets=[modal.Secret.from_name("groq-api-secrets")],
+    max_containers=5,
+    # keep_warm=1,   # اختياري لو عايزة container دايم شغال (بتكلف فلوس)
+)
+@modal.asgi_app()
+def api():
+    return fastapi_app

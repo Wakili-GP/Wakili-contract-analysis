@@ -1,7 +1,39 @@
-.env
-venv/
+# Python cache وملفات مؤقتة
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.log
+
+# البيئات الافتراضية
+venv/
+.env/
+.env.local
+.env.*.local
+
+# VS Code settings (مش لازم تترفع)
+.vscode/
+
+# الموديل المحلي الكبير (حجمه كبير جدًا، مش هترفعيه)
+my_model/
+my_model/*
+
+# ملفات مؤقتة من التطبيق
+temp_*.*
 temp.*
-*.pdf
-*.docx
-my_model
+*.tmp
+
+# Chroma databases محلية (هتتعمل في السحابة من جديد)
+chroma_db_*
+db_*
+chroma/
+
+# Modal volumes أو artifacts لو عملتي commit يدوي
+*.modal/
+modal-volumes/
+
+# macOS / Windows junk
+.DS_Store
+Thumbs.db
+
